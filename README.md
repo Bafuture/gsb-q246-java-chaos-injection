@@ -19,6 +19,118 @@ Pair-wise GSB 标注任务仓库（第 16 批 / 246）。
 ./mvnw -q verify
 ```
 
+## 框架使用文档
+
+一个零外部依赖的混沌故障注入框架，包名 `com.example.chaos`。
+
+### 1. 在业务代码中标记注入点
+
+业务代码只依赖静态门面 `Chaos`，注入点通过名字标识（支持中文，如“读存储前”“发消息后”）：
+
+```java
+// 有返回值：返回业务结果，或被故障替换 / 抛异常
+String data = Chaos.call("read-storage", () -> storage.read());
+
+// 无返回值
+Chaos.run("after-send-message", () -> metrics.increment());
+
+// 纯探针：只可能触发异常 / 延迟，不包裹业务逻辑
+Chaos.touch("before-read-storage");
+
+// 随调用携带上下文属性，供规则匹配
+Chaos.call("charge", Map.of("tenant", "gold"), () -> payment.charge());
+```
+
+### 2. 故障类型（`Faults` 工厂）
+
+| 工厂方法 | 行为 |
+|---------|------|
+| `Faults.exception(Supplier<Throwable>)` / `exception(Throwable)` / `exception(String)` | 在注入点抛出异常 |
+| `Faults.delay(Duration)` | 延迟指定时长后让业务继续执行 |
+| `Faults.timeout(Duration)` | 延迟指定时长后抛出 `ChaosTimeoutException` |
+| `Faults.returnError(Object)` | 不执行业务，直接返回错误结果（仅 `call` 点生效） |
+
+“只对一定比例生效”通过规则的 `probability(double, RandomGenerator)` 配置，见下文。
+
+### 3. 时间控制（可注入时钟）
+
+延迟与超时都走 `ChaosClock`，不直接 `Thread.sleep`：
+
+- `SystemChaosClock`（默认）：真实等待。
+- `TestClock`：虚拟时钟，`sleep` 只推进虚拟时间、不做真实等待，测试瞬时完成。
+
+```java
+TestClock clock = TestClock.startingAt(Instant.parse("2026-10-01T08:00:00Z"));
+Chaos.useClock(clock);
+// 注入 30s 延迟后，clock.now() 前进 30s，但墙钟几乎不流逝
+```
+
+### 4. 规则匹配
+
+规则由 `Rule.builder()` 构建，加入会话后按**顺序**匹配：第一条通过全部确定性匹配
+**且概率判定成功**的规则生效；概率未命中会继续尝试后续规则。
+
+| 匹配维度 | 构建方法 | 说明 |
+|---------|---------|------|
+| 注入点名称 | `point(String)` / `pointMatches(Predicate<String>)` | 精确或自定义（前缀/正则等）匹配 |
+| 调用次数区间 | `invocations(from, to)` / `invocation(n)` / `fromInvocation(n)` | 次数从 1 开始，闭区间；按“会话 + 注入点”分别计数，所有调用都计数（含未命中） |
+| 概率 | `probability(double)` / `probability(double, RandomGenerator)` | 取值 [0,1]；测试可传固定种子 `Random` 保证确定性 |
+| 自定义条件 | `when(Predicate<InjectionContext>)` | 可读调用次数、线程、业务上下文属性 |
+| 线程 | `forThread(Predicate<Thread>)` | 例如只对名为 `chaos-target` 的线程生效 |
+
+```java
+Rule rule = Rule.onPoint("read-storage")
+        .invocations(2, 5)                        // 第 2~5 次调用
+        .probability(0.5, new Random(42))        // 50% 概率
+        .when(ctx -> "gold".equals(ctx.attribute("tenant"))) // 仅 gold 租户
+        .forThread(t -> t.getName().equals("worker-1"))      // 仅指定线程
+        .fault(Faults.exception(new IOException("io")))
+        .build();
+```
+
+### 5. 作用域隔离
+
+规则放在会话（`ChaosSession`）中激活，会话实现 `AutoCloseable`：
+
+- **线程作用域**（默认）：`session.activate()` 只影响激活它的线程，其它线程完全无感。
+- **全局作用域**：`session.activateGlobally()` 对所有线程生效，可再用 `forThread` /
+  `when` 收窄。线程作用域优先于全局作用域（线程有本地会话时不回退全局）。
+- **上下文作用域**：`try (ChaosContext c = Chaos.openContext("tenant", "gold"))` 内
+  携带业务属性，规则通过 `when(ctx -> ...)` 实现“只对指定上下文生效”。
+- 会话 `close()` 或 `Chaos.reset()` 后立即失效，避免污染其它测试。
+
+### 6. 注入记录与捕获状态
+
+每次**实际注入**产生一条 `InjectionRecord`，包含：序号、时间（来自可注入时钟）、
+注入点、该点调用次数、故障类型、故障描述、延迟时长、抛出的异常实例、替换返回值、
+线程、上下文属性快照、捕获状态（`CaptureState`）。
+
+捕获状态三态：
+
+- `UNKNOWN`（默认）：尚未观察到业务处理；
+- `HANDLED`：业务正确捕获，通过 `Chaos.markHandled("注入点名")`（标记该点最近一次）
+  或 `Chaos.markHandled(异常实例)` 标记；
+- `ESCAPED`：未被捕获，通过 `Chaos.markEscaped("注入点名")` 标记。
+
+### 7. 一键关闭
+
+`Chaos.disable()` 后所有注入点直接透传：不匹配规则、不推进时钟、不产生记录，
+行为与未接入框架完全一致（见 `KillSwitchTest` 的等价性验证）。
+`Chaos.enable()` 恢复，`Chaos.reset()` 会清理全部会话、计数、记录并恢复启用。
+
+### 8. 代码结构
+
+| 类 | 职责 |
+|----|------|
+| `Chaos` | 静态门面，业务代码唯一依赖入口 |
+| `ChaosEngine` | 规则评估、计数、故障执行、记录存储 |
+| `ChaosSession` | 规则集合 + 线程/全局作用域 |
+| `Rule` | 名称/次数/概率/条件/线程匹配规则 |
+| `Fault` / `Faults` / `FaultOutcome` | 故障抽象、内建工厂、执行结果 |
+| `ChaosClock` / `SystemChaosClock` / `TestClock` | 可注入时钟（真实/虚拟） |
+| `ChaosContext` | 基于线程栈的上下文属性 |
+| `InjectionRecord` / `CaptureState` / `FaultType` | 记录与状态模型 |
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
